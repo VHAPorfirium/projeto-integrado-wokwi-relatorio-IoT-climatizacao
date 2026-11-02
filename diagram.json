@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "author": "IoT HVAC Project",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-dht22", "id": "dht", "top": -230.1, "left": 157.8, "attrs": {} },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd",
+      "top": 198.4,
+      "left": 159.2,
+      "attrs": { "pins": "i2c" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_comp",
+      "top": -157.2,
+      "left": 359,
+      "attrs": { "color": "blue", "label": "COMPRESSOR" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_erro",
+      "top": 15.6,
+      "left": 387.8,
+      "attrs": { "color": "red", "label": "FALHA" }
+    },
+    { "type": "wokwi-resistor", "id": "r1", "top": -50, "left": 250, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "r2", "top": 10, "left": 250, "attrs": { "value": "220" } }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "esp:3V3", "dht:VCC", "red", [ "v0" ] ],
+    [ "esp:GND.1", "dht:GND", "black", [ "v0" ] ],
+    [ "esp:4", "dht:SDA", "green", [ "v0" ] ],
+    [ "esp:GND.2", "lcd:GND", "black", [ "v0" ] ],
+    [ "esp:5V", "lcd:VCC", "red", [ "v0" ] ],
+    [ "esp:21", "lcd:SDA", "blue", [ "v0" ] ],
+    [ "esp:22", "lcd:SCL", "yellow", [ "v0" ] ],
+    [ "esp:14", "r1:1", "blue", [ "v0" ] ],
+    [ "r1:2", "led_comp:A", "blue", [ "v0" ] ],
+    [ "esp:GND.1", "led_comp:C", "black", [ "v0" ] ],
+    [ "esp:13", "r2:1", "red", [ "v0" ] ],
+    [ "r2:2", "led_erro:A", "red", [ "v0" ] ],
+    [ "esp:GND.2", "led_erro:C", "black", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}
