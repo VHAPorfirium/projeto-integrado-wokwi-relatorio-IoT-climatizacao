@@ -81,7 +81,7 @@ function doGet() {
 function extrairLeituraDoCorpoJson(evento) {
   const corpoDaRequisicao = evento && evento.postData ? evento.postData.contents : "";
   if (!corpoDaRequisicao) {
-    throw new Error("Requisição sem corpo JSON.");
+    throw new Error("Requisição sem corpo JSON. Para testar pelo editor, execute a função testarRecebimentoDeTelemetria.");
   }
 
   const dadosRecebidos = JSON.parse(corpoDaRequisicao);
@@ -136,13 +136,13 @@ function executarSemInterromperRegistro(nomeDaEtapa, etapa) {
 // =====================================================================
 function diagnosticoGeraAlerta(diagnostico) {
   return diagnostico === CONFIGURACAO.DIAGNOSTICO_FALHA_EFICIENCIA ||
-         diagnostico === CONFIGURACAO.DIAGNOSTICO_SENSOR_OFFLINE;
+    diagnostico === CONFIGURACAO.DIAGNOSTICO_SENSOR_OFFLINE;
 }
 
 // Avisa só na transição para a falha, e não a cada 7 segundos enquanto ela dura
 function notificarSeIniciouNovaFalha(diagnosticoAnterior, leituraAtual) {
   const iniciouNovaFalha = diagnosticoGeraAlerta(leituraAtual.diagnostico) &&
-                           leituraAtual.diagnostico !== diagnosticoAnterior;
+    leituraAtual.diagnostico !== diagnosticoAnterior;
   if (!iniciouNovaFalha || !CONFIGURACAO.ALERTAS_POR_EMAIL_ATIVADOS) {
     return;
   }
@@ -178,6 +178,7 @@ function onOpen() {
     .createMenu("Auditoria IoT")
     .addItem("Gerar relatório de falhas", "gerarRelatorioDeFalhas")
     .addItem("Configurar projeto (executar uma vez)", "configurarProjeto")
+    .addItem("Testar recebimento de telemetria", "testarRecebimentoDeTelemetria")
     .addToUi();
 }
 
@@ -401,10 +402,35 @@ function destacarLinhasDeFalhaNaTelemetria() {
 }
 
 // =====================================================================
-// 5. UTILITÁRIOS
+// 5. TESTE MANUAL (executar pelo editor ou pelo menu)
+// =====================================================================
+// O doPost só recebe dados quando chamado pela URL. Esta função simula o POST do ESP32.
+function testarRecebimentoDeTelemetria() {
+  const leituraSimuladaDoEsp32 = {
+    temperatura: 25.4,
+    umidade: 40.0,
+    setpoint: 23.0,
+    status_compressor: "LIGADO",
+    potencia_w: 1200.0,
+    diagnostico: CONFIGURACAO.DIAGNOSTICO_FALHA_EFICIENCIA
+  };
+
+  const requisicaoSimulada = {
+    postData: { contents: JSON.stringify(leituraSimuladaDoEsp32) }
+  };
+
+  const respostaDoEndpoint = doPost(requisicaoSimulada);
+  console.log("Resposta do doPost: " + respostaDoEndpoint.getContent());
+}
+
+// =====================================================================
+// 6. UTILITÁRIOS
 // =====================================================================
 function obterOuCriarAba(nomeDaAba) {
   const planilha = SpreadsheetApp.getActiveSpreadsheet();
+  if (!planilha) {
+    throw new Error("Script não está vinculado a uma planilha. Abra-o pela planilha em Extensões > Apps Script.");
+  }
   return planilha.getSheetByName(nomeDaAba) || planilha.insertSheet(nomeDaAba);
 }
 

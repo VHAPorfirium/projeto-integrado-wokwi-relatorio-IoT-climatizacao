@@ -25,8 +25,15 @@ namespace Configuracao {
 
   const char* const NOME_REDE_WIFI = "Wokwi-GUEST";
   const char* const SENHA_REDE_WIFI = "";
+  // Se o Wi-Fi cair ou não conectar no boot, tenta de novo sem travar o termostato
+  const unsigned long INTERVALO_ENTRE_TENTATIVAS_DE_RECONEXAO_WIFI_MS = 15000;
+
+  const char* const NOME_SERVIDOR_TELEMETRIA = "script.google.com";
   const char* const URL_GOOGLE_APPS_SCRIPT =
-      "";
+      "https://script.google.com/macros/s/AKfycbyIgbD3TfE7yOYCtrhXi-DGhCPKF7QrC1RJGXHnCi2yVY3nt2QqgOkokt2zGH05w2_3/exec";
+
+  // Testa DNS, TCP e TLS uma vez ao ligar. Desative quando o envio estiver funcionando.
+  const bool EXECUTAR_DIAGNOSTICO_DE_CONEXAO_AO_INICIAR = true;
 
   // Histerese: liga em >= 24,0 °C e desliga em <= 22,5 °C
   const float TEMPERATURA_ALVO_CELSIUS = 23.0;
@@ -42,6 +49,11 @@ namespace Configuracao {
 
   const unsigned long INTERVALO_LEITURA_SENSOR_MS = 2000;   // mínimo do DHT22
   const unsigned long INTERVALO_ENVIO_TELEMETRIA_MS = 7000; // estabilidade de sockets no Wokwi
+
+  // O handshake TLS é emulado no Wokwi e fica bem mais lento que num ESP32 real
+  const int32_t TEMPO_LIMITE_DE_CONEXAO_MS = 30000;
+  const uint16_t TEMPO_LIMITE_DE_RESPOSTA_MS = 15000;  // Cobre a "partida a frio" do Apps Script
+  const unsigned long TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS = 30;
 }
 
 // =====================================================================
@@ -235,29 +247,110 @@ public:
   ConexaoWifi(const char* nomeDaRede, const char* senhaDaRede)
       : nomeDaRede(nomeDaRede), senhaDaRede(senhaDaRede) {}
 
+  // Conexão inicial: espera um tempo limitado e segue em frente mesmo sem rede
   void conectar() {
     Serial.printf("[WIFI] Conectando a %s", nomeDaRede);
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(nomeDaRede, senhaDaRede);
 
-    for (int tentativa = 0; tentativa < QUANTIDADE_MAXIMA_DE_TENTATIVAS && !estaConectado(); tentativa++) {
-      delay(300);
+    for (int tentativa = 0; tentativa < QUANTIDADE_MAXIMA_DE_VERIFICACOES && !estaConectado(); tentativa++) {
+      delay(INTERVALO_ENTRE_VERIFICACOES_MS);
       Serial.print(".");
     }
 
     if (estaConectado()) {
-      Serial.printf("\n[WIFI] Conectado. IP: %s\n", WiFi.localIP().toString().c_str());
+      registrarConexaoEstabelecida();
     } else {
-      Serial.println("\n[WIFI] Falha ao conectar. O controle local continua funcionando.");
+      Serial.println("\n[WIFI] Falha ao conectar. Nova tentativa automatica em segundo plano.");
     }
+    instanteUltimaTentativaDeConexaoMs = millis();
+  }
+
+  // Chamado a cada ciclo: sem delay, para o controle do termostato nunca parar
+  void manterConectado(unsigned long instanteAtualMs) {
+    const bool conectadoAgora = estaConectado();
+    if (conectadoAgora && !estavaConectadoNoUltimoCiclo) {
+      registrarConexaoEstabelecida();
+    }
+    estavaConectadoNoUltimoCiclo = conectadoAgora;
+
+    const bool tempoDeTentarNovamente = instanteAtualMs - instanteUltimaTentativaDeConexaoMs >=
+                                        Configuracao::INTERVALO_ENTRE_TENTATIVAS_DE_RECONEXAO_WIFI_MS;
+    if (conectadoAgora || !tempoDeTentarNovamente) {
+      return;
+    }
+
+    Serial.println("[WIFI] Sem conexao. Tentando reconectar...");
+    WiFi.disconnect();
+    WiFi.begin(nomeDaRede, senhaDaRede);
+    instanteUltimaTentativaDeConexaoMs = instanteAtualMs;
   }
 
   bool estaConectado() const { return WiFi.status() == WL_CONNECTED; }
 
 private:
-  static const int QUANTIDADE_MAXIMA_DE_TENTATIVAS = 40;
+  static const int QUANTIDADE_MAXIMA_DE_VERIFICACOES = 60;          // 60 x 300 ms = 18 s
+  static const unsigned long INTERVALO_ENTRE_VERIFICACOES_MS = 300;
   const char* nomeDaRede;
   const char* senhaDaRede;
+  unsigned long instanteUltimaTentativaDeConexaoMs = 0;
+  bool estavaConectadoNoUltimoCiclo = false;
+
+  void registrarConexaoEstabelecida() {
+    Serial.printf("\n[WIFI] Conectado. IP: %s | RSSI=%d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    estavaConectadoNoUltimoCiclo = true;
+  }
+};
+
+// Testa cada camada da conexão separadamente para descobrir onde o envio falha
+class DiagnosticoDeConexao {
+public:
+  static void executar(const char* nomeDoServidor) {
+    Serial.printf("[DIAGNOSTICO] Testando conexao com %s\n", nomeDoServidor);
+    if (!verificarResolucaoDeNome(nomeDoServidor)) return;
+    if (!verificarConexaoTcp(nomeDoServidor)) return;
+    verificarHandshakeTls(nomeDoServidor);
+  }
+
+private:
+  static const uint16_t PORTA_HTTPS = 443;
+  static const int32_t TEMPO_LIMITE_TCP_MS = 15000;
+
+  static bool verificarResolucaoDeNome(const char* nomeDoServidor) {
+    IPAddress enderecoIpDoServidor;
+    const bool nomeResolvido = WiFi.hostByName(nomeDoServidor, enderecoIpDoServidor);
+    Serial.printf("[DIAGNOSTICO] DNS: %s (%s)\n", nomeResolvido ? "OK" : "FALHOU",
+                  enderecoIpDoServidor.toString().c_str());
+    return nomeResolvido;
+  }
+
+  static bool verificarConexaoTcp(const char* nomeDoServidor) {
+    WiFiClient clienteTcp;
+    const bool conexaoAberta = clienteTcp.connect(nomeDoServidor, PORTA_HTTPS, TEMPO_LIMITE_TCP_MS);
+    Serial.printf("[DIAGNOSTICO] TCP porta 443: %s\n", conexaoAberta ? "OK" : "FALHOU");
+    clienteTcp.stop();
+    return conexaoAberta;
+  }
+
+  static void verificarHandshakeTls(const char* nomeDoServidor) {
+    WiFiClientSecure clienteSeguro;
+    clienteSeguro.setInsecure();
+    clienteSeguro.setHandshakeTimeout(Configuracao::TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS);
+
+    const unsigned long instanteInicioMs = millis();
+    const bool handshakeConcluido = clienteSeguro.connect(nomeDoServidor, PORTA_HTTPS);
+    const unsigned long duracaoDoHandshakeMs = millis() - instanteInicioMs;
+
+    if (handshakeConcluido) {
+      Serial.printf("[DIAGNOSTICO] TLS: OK em %lu ms\n", duracaoDoHandshakeMs);
+    } else {
+      char mensagemDeErroTls[120];
+      clienteSeguro.lastError(mensagemDeErroTls, sizeof(mensagemDeErroTls));
+      Serial.printf("[DIAGNOSTICO] TLS: FALHOU apos %lu ms -> %s\n", duracaoDoHandshakeMs, mensagemDeErroTls);
+    }
+    clienteSeguro.stop();
+  }
 };
 
 class ClienteTelemetriaGoogleSheets {
@@ -286,10 +379,9 @@ public:
   }
 
 private:
-  static const int QUANTIDADE_MAXIMA_DE_TENTATIVAS_DE_ENVIO = 3;
+  // Com o tempo limite maior, 2 tentativas evitam travar o termostato por tempo demais
+  static const int QUANTIDADE_MAXIMA_DE_TENTATIVAS_DE_ENVIO = 2;
   static const unsigned long INTERVALO_ENTRE_TENTATIVAS_MS = 1500;
-  static const uint16_t TEMPO_LIMITE_DE_CONEXAO_MS = 8000;
-  static const uint16_t TEMPO_LIMITE_DE_RESPOSTA_MS = 15000;  // Cobre a "partida a frio" do Apps Script
   const char* urlDeDestino;
 
   // O handshake TLS precisa de um bloco contínuo grande de memória (~40 KB).
@@ -303,20 +395,21 @@ private:
   int tentarEnviar(const String& corpoJson) {
     WiFiClientSecure clienteSeguro;
     clienteSeguro.setInsecure();  // Sem validação de certificado (aceitável no simulador acadêmico)
+    clienteSeguro.setHandshakeTimeout(Configuracao::TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS);
 
     HTTPClient clienteHttp;
     clienteHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    clienteHttp.setConnectTimeout(TEMPO_LIMITE_DE_CONEXAO_MS);
-    clienteHttp.setTimeout(TEMPO_LIMITE_DE_RESPOSTA_MS);
+    clienteHttp.setConnectTimeout(Configuracao::TEMPO_LIMITE_DE_CONEXAO_MS);
+    clienteHttp.setTimeout(Configuracao::TEMPO_LIMITE_DE_RESPOSTA_MS);
 
     if (!clienteHttp.begin(clienteSeguro, urlDeDestino)) {
       Serial.println("[TELEMETRIA] Nao foi possivel iniciar a conexao HTTP.");
-      return -1;
+      return HTTPC_ERROR_CONNECTION_REFUSED;
     }
 
     clienteHttp.addHeader("Content-Type", "application/json");
     const int codigoRespostaHttp = clienteHttp.POST(corpoJson);
-    registrarResultadoDoEnvio(codigoRespostaHttp, clienteHttp);
+    registrarResultadoDoEnvio(codigoRespostaHttp, clienteHttp, clienteSeguro);
 
     clienteHttp.end();
     clienteSeguro.stop();  // Libera o socket TLS para o próximo envio
@@ -340,7 +433,7 @@ private:
     return corpoJson;
   }
 
-  void registrarResultadoDoEnvio(int codigoRespostaHttp, HTTPClient& clienteHttp) const {
+  void registrarResultadoDoEnvio(int codigoRespostaHttp, HTTPClient& clienteHttp, WiFiClientSecure& clienteSeguro) const {
     // O Apps Script executa o doPost e depois responde 302 (redirecionamento para o resultado)
     const bool envioRegistrado = codigoRespostaHttp == 200 || codigoRespostaHttp == 302;
     if (envioRegistrado) {
@@ -348,8 +441,11 @@ private:
     } else if (codigoRespostaHttp > 0) {
       Serial.printf("[TELEMETRIA] Servidor respondeu HTTP %d\n", codigoRespostaHttp);
     } else {
-      Serial.printf("[TELEMETRIA] Falha de envio: %s (codigo %d)\n",
-                    clienteHttp.errorToString(codigoRespostaHttp).c_str(), codigoRespostaHttp);
+      // O erro do TLS diz o motivo real por trás do "connection refused"
+      char mensagemDeErroTls[120];
+      clienteSeguro.lastError(mensagemDeErroTls, sizeof(mensagemDeErroTls));
+      Serial.printf("[TELEMETRIA] Falha de envio: %s (codigo %d) | TLS: %s\n",
+                    clienteHttp.errorToString(codigoRespostaHttp).c_str(), codigoRespostaHttp, mensagemDeErroTls);
     }
   }
 };
@@ -369,11 +465,15 @@ public:
     sensorAmbiente.iniciar();
 
     conexaoWifi.conectar();
+    executarDiagnosticoDeConexaoUmaVez();
     displayDeStatus.mostrarMensagem("Sistema pronto", conexaoWifi.estaConectado() ? "WiFi: OK" : "WiFi: OFFLINE");
   }
 
   void executarCiclo() {
     const unsigned long instanteAtualMs = millis();
+
+    conexaoWifi.manterConectado(instanteAtualMs);
+    executarDiagnosticoDeConexaoUmaVez();
 
     if (intervaloFoiAtingido(instanteUltimaLeituraMs, Configuracao::INTERVALO_LEITURA_SENSOR_MS, instanteAtualMs)) {
       processarNovaLeitura(instanteAtualMs);
@@ -398,6 +498,19 @@ private:
   bool possuiEstadoProcessado = false;
   unsigned long instanteUltimaLeituraMs = 0;
   unsigned long instanteUltimoEnvioMs = 0;
+  bool diagnosticoDeConexaoJaExecutado = false;
+
+  // Roda na primeira vez que o Wi-Fi conecta, mesmo que isso aconteça depois do boot
+  void executarDiagnosticoDeConexaoUmaVez() {
+    const bool deveExecutarDiagnostico = Configuracao::EXECUTAR_DIAGNOSTICO_DE_CONEXAO_AO_INICIAR &&
+                                         !diagnosticoDeConexaoJaExecutado && conexaoWifi.estaConectado();
+    if (!deveExecutarDiagnostico) {
+      return;
+    }
+    displayDeStatus.mostrarMensagem("Testando rede...", "Aguarde");
+    DiagnosticoDeConexao::executar(Configuracao::NOME_SERVIDOR_TELEMETRIA);
+    diagnosticoDeConexaoJaExecutado = true;
+  }
 
   bool intervaloFoiAtingido(unsigned long& instanteUltimaExecucaoMs, unsigned long intervaloMs, unsigned long instanteAtualMs) {
     if (instanteAtualMs - instanteUltimaExecucaoMs < intervaloMs) {
