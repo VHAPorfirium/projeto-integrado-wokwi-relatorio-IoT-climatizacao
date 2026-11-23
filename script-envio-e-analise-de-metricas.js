@@ -136,13 +136,13 @@ function executarSemInterromperRegistro(nomeDaEtapa, etapa) {
 // =====================================================================
 function diagnosticoGeraAlerta(diagnostico) {
   return diagnostico === CONFIGURACAO.DIAGNOSTICO_FALHA_EFICIENCIA ||
-    diagnostico === CONFIGURACAO.DIAGNOSTICO_SENSOR_OFFLINE;
+         diagnostico === CONFIGURACAO.DIAGNOSTICO_SENSOR_OFFLINE;
 }
 
 // Avisa só na transição para a falha, e não a cada 7 segundos enquanto ela dura
 function notificarSeIniciouNovaFalha(diagnosticoAnterior, leituraAtual) {
   const iniciouNovaFalha = diagnosticoGeraAlerta(leituraAtual.diagnostico) &&
-    leituraAtual.diagnostico !== diagnosticoAnterior;
+                           leituraAtual.diagnostico !== diagnosticoAnterior;
   if (!iniciouNovaFalha || !CONFIGURACAO.ALERTAS_POR_EMAIL_ATIVADOS) {
     return;
   }
