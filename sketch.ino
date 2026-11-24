@@ -1,13 +1,15 @@
 /*
  * Nó de Borda IoT - Climatização com Auditoria de Eficiência Térmica
+ * Integrado diretamente à API de Chamados e Relatórios (Plataforma Centinela Soluções)
  *
  * Organização em camadas (de dentro para fora):
  *   1. Domínio     -> regras do termostato e do diagnóstico (não conhece hardware)
- *   2. Adaptadores -> sensor DHT22, saídas digitais, display LCD, Wi-Fi e telemetria HTTP
+ *   2. Adaptadores -> sensor DHT22, saídas digitais, display LCD, Wi-Fi e telemetria HTTP/HTTPS
  *   3. Aplicação   -> orquestra o ciclo: ler -> decidir -> atuar -> exibir -> reportar
  */
 
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Wire.h>
@@ -28,11 +30,17 @@ namespace Configuracao {
   // Se o Wi-Fi cair ou não conectar no boot, tenta de novo sem travar o termostato
   const unsigned long INTERVALO_ENTRE_TENTATIVAS_DE_RECONEXAO_WIFI_MS = 15000;
 
-  const char* const NOME_SERVIDOR_TELEMETRIA = "script.google.com";
-  const char* const URL_GOOGLE_APPS_SCRIPT =
-      "https://script.google.com/macros/s/AKfycbyIgbD3TfE7yOYCtrhXi-DGhCPKF7QrC1RJGXHnCi2yVY3nt2QqgOkokt2zGH05w2_3/exec";
+  // -------------------------------------------------------------------
+  // INTEGRAÇÃO COM A API CENTINELA (copie do modal "Dispositivos IoT")
+  // Aceita tanto https:// (porta 443) quanto http:// (ex.: porta 80 ou 8086)
+  // -------------------------------------------------------------------
+  const char* const NOME_SERVIDOR_TELEMETRIA = "seu-servidor-centinela.com";
+  const uint16_t PORTA_SERVIDOR_TELEMETRIA = 443;
+  const char* const URL_API_TELEMETRIA =
+      "https://seu-servidor-centinela.com/api/chamados/iot/telemetria";
+  const char* const CHAVE_API_DISPOSITIVO = "COLE_SUA_X_API_KEY_AQUI";
 
-  // Testa DNS, TCP e TLS uma vez ao ligar. Desative quando o envio estiver funcionando.
+  // Testa DNS, TCP e TLS (quando HTTPS) uma vez ao ligar. Desative quando estiver validado.
   const bool EXECUTAR_DIAGNOSTICO_DE_CONEXAO_AO_INICIAR = true;
 
   // Histerese: liga em >= 24,0 °C e desliga em <= 22,5 °C
@@ -51,9 +59,9 @@ namespace Configuracao {
   const unsigned long INTERVALO_ENVIO_TELEMETRIA_MS = 7000; // estabilidade de sockets no Wokwi
 
   // O handshake TLS é emulado no Wokwi e fica bem mais lento que num ESP32 real
-  const int32_t TEMPO_LIMITE_DE_CONEXAO_MS = 30000;
-  const uint16_t TEMPO_LIMITE_DE_RESPOSTA_MS = 15000;  // Cobre a "partida a frio" do Apps Script
-  const unsigned long TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS = 30;
+  const int32_t TEMPO_LIMITE_DE_CONEXAO_MS = 20000;
+  const uint16_t TEMPO_LIMITE_DE_RESPOSTA_MS = 12000;
+  const unsigned long TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS = 25;
 }
 
 // =====================================================================
@@ -84,13 +92,13 @@ class DescricaoDiagnostico {
 public:
   static const char* paraTelemetria(Diagnostico diagnostico) {
     switch (diagnostico) {
-      case Diagnostico::STANDBY_ECO:         return "STANDBY_ECO";
-      case Diagnostico::RESFRIANDO:          return "RESFRIANDO";
-      case Diagnostico::RESFRIANDO_OK:       return "RESFRIANDO_OK";
-      case Diagnostico::FALHA_EFICIENCIA:    return "FALHA_EFICIENCIA";
-      case Diagnostico::ERRO_SENSOR_OFFLINE: return "ERRO_SENSOR_OFFLINE";
+      case Diagnostico::STANDBY_ECO:         return "standby_eco";
+      case Diagnostico::RESFRIANDO:          return "resfriando";
+      case Diagnostico::RESFRIANDO_OK:       return "resfriando_ok";
+      case Diagnostico::FALHA_EFICIENCIA:    return "falha_eficiencia";
+      case Diagnostico::ERRO_SENSOR_OFFLINE: return "erro_sensor_offline";
     }
-    return "DESCONHECIDO";
+    return "standby_eco";
   }
 
   static const char* paraDisplay(Diagnostico diagnostico) {
@@ -233,7 +241,6 @@ private:
   static const uint8_t QUANTIDADE_DE_COLUNAS = 16;
   LiquidCrystal_I2C displayLcd;
 
-  // Preenche a linha inteira com espaços para não sobrar lixo de mensagens anteriores
   void escreverLinha(uint8_t numeroDaLinha, const char* texto) {
     char textoComPreenchimento[QUANTIDADE_DE_COLUNAS + 1];
     snprintf(textoComPreenchimento, sizeof(textoComPreenchimento), "%-16s", texto);
@@ -247,7 +254,6 @@ public:
   ConexaoWifi(const char* nomeDaRede, const char* senhaDaRede)
       : nomeDaRede(nomeDaRede), senhaDaRede(senhaDaRede) {}
 
-  // Conexão inicial: espera um tempo limitado e segue em frente mesmo sem rede
   void conectar() {
     Serial.printf("[WIFI] Conectando a %s", nomeDaRede);
     WiFi.mode(WIFI_STA);
@@ -267,7 +273,6 @@ public:
     instanteUltimaTentativaDeConexaoMs = millis();
   }
 
-  // Chamado a cada ciclo: sem delay, para o controle do termostato nunca parar
   void manterConectado(unsigned long instanteAtualMs) {
     const bool conectadoAgora = estaConectado();
     if (conectadoAgora && !estavaConectadoNoUltimoCiclo) {
@@ -290,7 +295,7 @@ public:
   bool estaConectado() const { return WiFi.status() == WL_CONNECTED; }
 
 private:
-  static const int QUANTIDADE_MAXIMA_DE_VERIFICACOES = 60;          // 60 x 300 ms = 18 s
+  static const int QUANTIDADE_MAXIMA_DE_VERIFICACOES = 60;
   static const unsigned long INTERVALO_ENTRE_VERIFICACOES_MS = 300;
   const char* nomeDaRede;
   const char* senhaDaRede;
@@ -306,15 +311,17 @@ private:
 // Testa cada camada da conexão separadamente para descobrir onde o envio falha
 class DiagnosticoDeConexao {
 public:
-  static void executar(const char* nomeDoServidor) {
-    Serial.printf("[DIAGNOSTICO] Testando conexao com %s\n", nomeDoServidor);
+  static void executar(const char* nomeDoServidor, uint16_t porta, bool usarTls) {
+    Serial.printf("[DIAGNOSTICO] Testando conexao com %s:%u (%s)\n",
+                  nomeDoServidor, porta, usarTls ? "HTTPS" : "HTTP");
     if (!verificarResolucaoDeNome(nomeDoServidor)) return;
-    if (!verificarConexaoTcp(nomeDoServidor)) return;
-    verificarHandshakeTls(nomeDoServidor);
+    if (!verificarConexaoTcp(nomeDoServidor, porta)) return;
+    if (usarTls) {
+      verificarHandshakeTls(nomeDoServidor, porta);
+    }
   }
 
 private:
-  static const uint16_t PORTA_HTTPS = 443;
   static const int32_t TEMPO_LIMITE_TCP_MS = 15000;
 
   static bool verificarResolucaoDeNome(const char* nomeDoServidor) {
@@ -325,21 +332,21 @@ private:
     return nomeResolvido;
   }
 
-  static bool verificarConexaoTcp(const char* nomeDoServidor) {
+  static bool verificarConexaoTcp(const char* nomeDoServidor, uint16_t porta) {
     WiFiClient clienteTcp;
-    const bool conexaoAberta = clienteTcp.connect(nomeDoServidor, PORTA_HTTPS, TEMPO_LIMITE_TCP_MS);
-    Serial.printf("[DIAGNOSTICO] TCP porta 443: %s\n", conexaoAberta ? "OK" : "FALHOU");
+    const bool conexaoAberta = clienteTcp.connect(nomeDoServidor, porta, TEMPO_LIMITE_TCP_MS);
+    Serial.printf("[DIAGNOSTICO] TCP porta %u: %s\n", porta, conexaoAberta ? "OK" : "FALHOU");
     clienteTcp.stop();
     return conexaoAberta;
   }
 
-  static void verificarHandshakeTls(const char* nomeDoServidor) {
+  static void verificarHandshakeTls(const char* nomeDoServidor, uint16_t porta) {
     WiFiClientSecure clienteSeguro;
     clienteSeguro.setInsecure();
     clienteSeguro.setHandshakeTimeout(Configuracao::TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS);
 
     const unsigned long instanteInicioMs = millis();
-    const bool handshakeConcluido = clienteSeguro.connect(nomeDoServidor, PORTA_HTTPS);
+    const bool handshakeConcluido = clienteSeguro.connect(nomeDoServidor, porta);
     const unsigned long duracaoDoHandshakeMs = millis() - instanteInicioMs;
 
     if (handshakeConcluido) {
@@ -353,9 +360,14 @@ private:
   }
 };
 
-class ClienteTelemetriaGoogleSheets {
+class ClienteTelemetriaApi {
 public:
-  explicit ClienteTelemetriaGoogleSheets(const char* urlDeDestino) : urlDeDestino(urlDeDestino) {}
+  ClienteTelemetriaApi(const char* urlDeDestino, const char* chaveApi)
+      : urlDeDestino(urlDeDestino), chaveApi(chaveApi) {}
+
+  bool usaHttps() const {
+    return strncmp(urlDeDestino, "https://", 8) == 0;
+  }
 
   void enviar(const EstadoClimatizacao& estado) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -365,9 +377,9 @@ public:
 
     const String corpoJson = montarCorpoJson(estado);
     for (int numeroDaTentativa = 1; numeroDaTentativa <= QUANTIDADE_MAXIMA_DE_TENTATIVAS_DE_ENVIO; numeroDaTentativa++) {
-      const int codigoRespostaHttp = tentarEnviar(corpoJson);
-      // Só repete quando os dados não chegaram ao servidor. Em timeout de leitura o
-      // Apps Script já recebeu o JSON, e repetir gravaria uma linha duplicada.
+      const int codigoRespostaHttp = usaHttps()
+                                         ? tentarEnviarHttps(corpoJson)
+                                         : tentarEnviarHttp(corpoJson);
       const bool dadosNaoChegaramAoServidor = codigoRespostaHttp == HTTPC_ERROR_CONNECTION_REFUSED;
       if (!dadosNaoChegaramAoServidor) {
         return;
@@ -379,45 +391,67 @@ public:
   }
 
 private:
-  // Com o tempo limite maior, 2 tentativas evitam travar o termostato por tempo demais
   static const int QUANTIDADE_MAXIMA_DE_TENTATIVAS_DE_ENVIO = 2;
   static const unsigned long INTERVALO_ENTRE_TENTATIVAS_MS = 1500;
   const char* urlDeDestino;
+  const char* chaveApi;
 
-  // O handshake TLS precisa de um bloco contínuo grande de memória (~40 KB).
-  // Se o "maior bloco livre" cair muito, a falha é de memória, e não de rede.
   void registrarSituacaoDaMemoria() const {
     Serial.printf("[MEMORIA] Livre=%u bytes | Maior bloco livre=%u bytes | Wi-Fi RSSI=%d dBm\n",
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap(), WiFi.RSSI());
   }
 
-  // Retorna o código HTTP (>0) ou o código de erro de conexão (<0)
-  int tentarEnviar(const String& corpoJson) {
+  int tentarEnviarHttps(const String& corpoJson) {
     WiFiClientSecure clienteSeguro;
-    clienteSeguro.setInsecure();  // Sem validação de certificado (aceitável no simulador acadêmico)
+    clienteSeguro.setInsecure();  // Sem validação de certificado no simulador Wokwi
     clienteSeguro.setHandshakeTimeout(Configuracao::TEMPO_LIMITE_DO_HANDSHAKE_TLS_SEGUNDOS);
 
     HTTPClient clienteHttp;
-    clienteHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    clienteHttp.setConnectTimeout(Configuracao::TEMPO_LIMITE_DE_CONEXAO_MS);
-    clienteHttp.setTimeout(Configuracao::TEMPO_LIMITE_DE_RESPOSTA_MS);
+    configurarHttpClient(clienteHttp);
 
     if (!clienteHttp.begin(clienteSeguro, urlDeDestino)) {
+      Serial.println("[TELEMETRIA] Nao foi possivel iniciar a conexao HTTPS.");
+      return HTTPC_ERROR_CONNECTION_REFUSED;
+    }
+
+    const int codigoRespostaHttp = executarPost(clienteHttp, corpoJson);
+    registrarResultadoDoEnvio(codigoRespostaHttp, clienteHttp, &clienteSeguro);
+
+    clienteHttp.end();
+    clienteSeguro.stop();
+    return codigoRespostaHttp;
+  }
+
+  int tentarEnviarHttp(const String& corpoJson) {
+    WiFiClient clienteSimples;
+    HTTPClient clienteHttp;
+    configurarHttpClient(clienteHttp);
+
+    if (!clienteHttp.begin(clienteSimples, urlDeDestino)) {
       Serial.println("[TELEMETRIA] Nao foi possivel iniciar a conexao HTTP.");
       return HTTPC_ERROR_CONNECTION_REFUSED;
     }
 
-    clienteHttp.addHeader("Content-Type", "application/json");
-    const int codigoRespostaHttp = clienteHttp.POST(corpoJson);
-    registrarResultadoDoEnvio(codigoRespostaHttp, clienteHttp, clienteSeguro);
+    const int codigoRespostaHttp = executarPost(clienteHttp, corpoJson);
+    registrarResultadoDoEnvio(codigoRespostaHttp, clienteHttp, nullptr);
 
     clienteHttp.end();
-    clienteSeguro.stop();  // Libera o socket TLS para o próximo envio
+    clienteSimples.stop();
     return codigoRespostaHttp;
   }
 
+  void configurarHttpClient(HTTPClient& clienteHttp) const {
+    clienteHttp.setConnectTimeout(Configuracao::TEMPO_LIMITE_DE_CONEXAO_MS);
+    clienteHttp.setTimeout(Configuracao::TEMPO_LIMITE_DE_RESPOSTA_MS);
+  }
+
+  int executarPost(HTTPClient& clienteHttp, const String& corpoJson) const {
+    clienteHttp.addHeader("Content-Type", "application/json");
+    clienteHttp.addHeader("X-Api-Key", chaveApi);
+    return clienteHttp.POST(corpoJson);
+  }
+
   String montarCorpoJson(const EstadoClimatizacao& estado) const {
-    // Com o sensor offline enviamos null, para não poluir a auditoria com 0 °C falsos
     const bool leituraValida = estado.leituraAmbiente.leituraValida;
     const String temperaturaJson = leituraValida ? String(estado.leituraAmbiente.temperaturaCelsius, 1) : String("null");
     const String umidadeJson = leituraValida ? String(estado.leituraAmbiente.umidadeRelativaPercentual, 1) : String("null");
@@ -426,26 +460,35 @@ private:
     corpoJson += "\"temperatura\":" + temperaturaJson + ",";
     corpoJson += "\"umidade\":" + umidadeJson + ",";
     corpoJson += "\"setpoint\":" + String(Configuracao::TEMPERATURA_ALVO_CELSIUS, 1) + ",";
-    corpoJson += "\"status_compressor\":\"" + String(estado.compressorLigado ? "LIGADO" : "DESLIGADO") + "\",";
+    corpoJson += "\"status_compressor\":\"" + String(estado.compressorLigado ? "ligado" : "desligado") + "\",";
     corpoJson += "\"potencia_w\":" + String(estado.potenciaEstimadaWatts, 1) + ",";
     corpoJson += "\"diagnostico\":\"" + String(DescricaoDiagnostico::paraTelemetria(estado.diagnostico)) + "\"";
     corpoJson += "}";
     return corpoJson;
   }
 
-  void registrarResultadoDoEnvio(int codigoRespostaHttp, HTTPClient& clienteHttp, WiFiClientSecure& clienteSeguro) const {
-    // O Apps Script executa o doPost e depois responde 302 (redirecionamento para o resultado)
-    const bool envioRegistrado = codigoRespostaHttp == 200 || codigoRespostaHttp == 302;
+  void registrarResultadoDoEnvio(int codigoRespostaHttp, HTTPClient& clienteHttp, WiFiClientSecure* clienteSeguro) const {
+    const bool envioRegistrado = codigoRespostaHttp == 200 || codigoRespostaHttp == 201;
     if (envioRegistrado) {
-      Serial.printf("[TELEMETRIA] Registrado na planilha (HTTP %d)\n", codigoRespostaHttp);
+      const String resposta = clienteHttp.getString();
+      const bool abriuChamado = resposta.indexOf("\"chamadoAbertoId\":\"") >= 0;
+      if (abriuChamado) {
+        Serial.printf("[TELEMETRIA] Registrado na API (HTTP %d) -> CHAMADO ABERTO AUTOMATICAMENTE! %s\n",
+                      codigoRespostaHttp, resposta.c_str());
+      } else {
+        Serial.printf("[TELEMETRIA] Registrado na API Centinela (HTTP %d)\n", codigoRespostaHttp);
+      }
     } else if (codigoRespostaHttp > 0) {
-      Serial.printf("[TELEMETRIA] Servidor respondeu HTTP %d\n", codigoRespostaHttp);
-    } else {
-      // O erro do TLS diz o motivo real por trás do "connection refused"
+      Serial.printf("[TELEMETRIA] API respondeu HTTP %d -> %s\n",
+                    codigoRespostaHttp, clienteHttp.getString().c_str());
+    } else if (clienteSeguro != nullptr) {
       char mensagemDeErroTls[120];
-      clienteSeguro.lastError(mensagemDeErroTls, sizeof(mensagemDeErroTls));
+      clienteSeguro->lastError(mensagemDeErroTls, sizeof(mensagemDeErroTls));
       Serial.printf("[TELEMETRIA] Falha de envio: %s (codigo %d) | TLS: %s\n",
                     clienteHttp.errorToString(codigoRespostaHttp).c_str(), codigoRespostaHttp, mensagemDeErroTls);
+    } else {
+      Serial.printf("[TELEMETRIA] Falha de envio HTTP: %s (codigo %d)\n",
+                    clienteHttp.errorToString(codigoRespostaHttp).c_str(), codigoRespostaHttp);
     }
   }
 };
@@ -466,7 +509,7 @@ public:
 
     conexaoWifi.conectar();
     executarDiagnosticoDeConexaoUmaVez();
-    displayDeStatus.mostrarMensagem("Sistema pronto", conexaoWifi.estaConectado() ? "WiFi: OK" : "WiFi: OFFLINE");
+    displayDeStatus.mostrarMensagem("API Centinela", conexaoWifi.estaConectado() ? "WiFi: OK" : "WiFi: OFFLINE");
   }
 
   void executarCiclo() {
@@ -479,8 +522,13 @@ public:
       processarNovaLeitura(instanteAtualMs);
     }
 
-    if (possuiEstadoProcessado &&
-        intervaloFoiAtingido(instanteUltimoEnvioMs, Configuracao::INTERVALO_ENVIO_TELEMETRIA_MS, instanteAtualMs)) {
+    const bool deveEnviarAgora = possuiEstadoProcessado &&
+        (envioImediatoPendente ||
+         intervaloFoiAtingido(instanteUltimoEnvioMs, Configuracao::INTERVALO_ENVIO_TELEMETRIA_MS, instanteAtualMs));
+
+    if (deveEnviarAgora) {
+      envioImediatoPendente = false;
+      instanteUltimoEnvioMs = instanteAtualMs;
       clienteTelemetria.enviar(estadoAtual);
     }
   }
@@ -491,24 +539,27 @@ private:
   SaidaDigital indicadorDeFalha{Configuracao::PINO_INDICADOR_FALHA};
   DisplayDeStatus displayDeStatus{Configuracao::ENDERECO_I2C_DISPLAY};
   ConexaoWifi conexaoWifi{Configuracao::NOME_REDE_WIFI, Configuracao::SENHA_REDE_WIFI};
-  ClienteTelemetriaGoogleSheets clienteTelemetria{Configuracao::URL_GOOGLE_APPS_SCRIPT};
+  ClienteTelemetriaApi clienteTelemetria{Configuracao::URL_API_TELEMETRIA, Configuracao::CHAVE_API_DISPOSITIVO};
   ControladorTermostato controladorTermostato;
 
   EstadoClimatizacao estadoAtual{};
   bool possuiEstadoProcessado = false;
+  bool envioImediatoPendente = false;
   unsigned long instanteUltimaLeituraMs = 0;
   unsigned long instanteUltimoEnvioMs = 0;
   bool diagnosticoDeConexaoJaExecutado = false;
 
-  // Roda na primeira vez que o Wi-Fi conecta, mesmo que isso aconteça depois do boot
   void executarDiagnosticoDeConexaoUmaVez() {
     const bool deveExecutarDiagnostico = Configuracao::EXECUTAR_DIAGNOSTICO_DE_CONEXAO_AO_INICIAR &&
                                          !diagnosticoDeConexaoJaExecutado && conexaoWifi.estaConectado();
     if (!deveExecutarDiagnostico) {
       return;
     }
-    displayDeStatus.mostrarMensagem("Testando rede...", "Aguarde");
-    DiagnosticoDeConexao::executar(Configuracao::NOME_SERVIDOR_TELEMETRIA);
+    displayDeStatus.mostrarMensagem("Testando API...", "Aguarde");
+    DiagnosticoDeConexao::executar(
+        Configuracao::NOME_SERVIDOR_TELEMETRIA,
+        Configuracao::PORTA_SERVIDOR_TELEMETRIA,
+        clienteTelemetria.usaHttps());
     diagnosticoDeConexaoJaExecutado = true;
   }
 
@@ -524,18 +575,21 @@ private:
     const LeituraAmbiente leituraAmbiente = sensorAmbiente.ler();
     const EstadoClimatizacao novoEstado = controladorTermostato.processarLeitura(leituraAmbiente, instanteAtualMs);
 
-    // O LED de falha é derivado do diagnóstico atual, então ele apaga sozinho quando o problema some
+    const bool diagnosticoMudou = !possuiEstadoProcessado || novoEstado.diagnostico != estadoAtual.diagnostico;
+
     releCompressor.definirEstado(novoEstado.compressorLigado);
     indicadorDeFalha.definirEstado(DescricaoDiagnostico::indicaFalha(novoEstado.diagnostico));
     displayDeStatus.mostrarEstado(novoEstado);
-    registrarNoMonitorSerial(novoEstado);
+    registrarNoMonitorSerial(novoEstado, diagnosticoMudou);
 
     estadoAtual = novoEstado;
     possuiEstadoProcessado = true;
+    if (diagnosticoMudou) {
+      envioImediatoPendente = true;  // Reporta transições de estado na hora para o frontend e abertura de chamado
+    }
   }
 
-  void registrarNoMonitorSerial(const EstadoClimatizacao& novoEstado) const {
-    const bool diagnosticoMudou = !possuiEstadoProcessado || novoEstado.diagnostico != estadoAtual.diagnostico;
+  void registrarNoMonitorSerial(const EstadoClimatizacao& novoEstado, bool diagnosticoMudou) const {
     if (diagnosticoMudou) {
       Serial.printf("[EVENTO] Diagnostico alterado para %s\n", DescricaoDiagnostico::paraTelemetria(novoEstado.diagnostico));
     }
